@@ -1,0 +1,923 @@
+---
+
+title: 'Time Series Group Project'
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+
+
+# Introduction
+
+This is a comprehensive Exploratory Data Analysis for the [Web Traffic Time Series Forecasting](https://www.kaggle.com/c/web-traffic-time-series-forecasting) competition with tidy R.
+
+This challenge is about predicting the future behaviour of time series' that describe the web traffic for Wikipedia articles. The [data](https://www.kaggle.com/c/web-traffic-time-series-forecasting/data) contains about 145k time series and comes in two separate files: *train_1.csv* holds the traffic data, where each column is a date and each row is an article, and *key_1.csv* contains a mapping between page names and a unique ID column (to be used in the submission file).
+
+
+## Load libraries and data files
+
+```{r, message = FALSE}
+library('ggplot2') # visualization
+library('ggthemes') # visualization
+library('scales') # visualization
+library('grid') # visualisation
+library('gridExtra') # visualisation
+library('corrplot') # visualisation
+library('ggrepel') # visualisation
+library('RColorBrewer') # visualisation
+library('data.table') # data manipulation
+library('dplyr') # data manipulation
+library('readr') # data input
+library('tibble') # data wrangling
+library('tidyr') # data wrangling
+library('lazyeval') # data wrangling
+library('broom') # data wrangling
+library('stringr') # string manipulation
+library('purrr') # string manipulation
+library('forcats') # factor manipulation
+library('lubridate') # date and time
+library('forecast') # time series analysis
+#library('prophet') # time series analysis
+```
+
+
+
+```{r, echo=FALSE}
+# Define multiple plot function
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+
+## Load data
+
+Note, that the *key_1.csv* data is not small with about 700 MB and for the purpose of this exploration we only read a few rows to show its structure.
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE, results=FALSE}
+train <- as.tibble(fread('/Volumes/MacBKP/TimeSeriesProjectInput/train_1.csv'))
+key <- as.tibble(fread('/Volumes/MacBKP/TimeSeriesProjectInput/key_1.csv', nrows = 5))
+```
+
+## File structure and content
+
+Those are the dimensions of the *train* data set:
+
+```{r}
+c(ncol(train),nrow(train))
+```
+
+The data is originally structured so that 550 dates refer to a column each:
+
+```{r}
+train %>% colnames() %>% head(5)
+```
+
+and the 145k article nanes are stored in the additional *Page* column:
+
+```{r}
+train %>% select(Page) %>% head(5)
+```
+
+The *key* data contains a unique alpha-numerical ID for each *Page* and *Date* combination, which is the reason for the relatively large file size.
+
+```{r}
+glimpse(key)
+```
+
+
+## Missing values
+
+```{r}
+sum(is.na(train))/(ncol(train)*nrow(train))
+```
+
+There are about 8% of missing values in this data set, which is not trivial. We will neeed to take them into account in our analysis.
+
+
+# Data transformation and helper functions
+
+## Article names and metadata
+
+To make the training data easier to handle we split it into two parts: the article information (from the *Page* column) and the time series data (*tdates*) from the date columns. We briefly separate the article information into data from *wikipedia*, *wikimedia*, and *mediawiki* due to the different formatting of the *Page* names. After that, we rejoin all article information into a common data set (*tpages*).
+
+```{r}
+tdates <- train %>% select(-Page)
+
+foo <- train %>% select(Page) %>% rownames_to_column()
+mediawiki <- foo %>% filter(str_detect(Page, "mediawiki"))
+wikimedia <- foo %>% filter(str_detect(Page, "wikimedia"))
+wikipedia <- foo %>% filter(str_detect(Page, "wikipedia")) %>% 
+  filter(!str_detect(Page, "wikimedia")) %>%
+  filter(!str_detect(Page, "mediawiki"))
+
+wikipedia <- wikipedia %>%
+  separate(Page, into = c("foo", "bar"), sep = ".wikipedia.org_") %>%
+  separate(foo, into = c("article", "locale"), sep = -3) %>%
+  separate(bar, into = c("access", "agent"), sep = "_") %>%
+  mutate(locale = str_sub(locale,2,3))
+
+wikimedia <- wikimedia %>%
+  separate(Page, into = c("article", "bar"), sep = "_commons.wikimedia.org_") %>%
+  separate(bar, into = c("access", "agent"), sep = "_") %>%
+  add_column(locale = "wikmed")
+
+mediawiki <- mediawiki %>%
+  separate(Page, into = c("article", "bar"), sep = "_www.mediawiki.org_") %>%
+  separate(bar, into = c("access", "agent"), sep = "_") %>%
+  add_column(locale = "medwik")
+
+tpages <- wikipedia %>%
+  full_join(wikimedia, by = c("rowname", "article", "locale", "access", "agent")) %>%
+  full_join(mediawiki, by = c("rowname", "article", "locale", "access", "agent"))
+
+sample_n(tpages, size = 5)
+```
+
+Now we can search for certain *Page* subjects and filter their meta parameters:
+
+```{r}
+tpages %>% filter(str_detect(article, "The_Beatle")) %>%
+  filter(access == "all-access") %>%
+  filter(agent == "all-agents")
+
+
+
+```
+
+
+## Time series extraction
+
+In order to plot the time series data we use a helper function that allows us to extract the time series for a specified row number. (The normalised version is to facilitate the coparision between multiple time series curves, to correct for large differences in view count.)
+
+```{r}
+extract_ts <- function(rownr){
+  tdates %>%
+    filter_((interp(~x == row_number(), .values = list(x = rownr)))) %>%
+    rownames_to_column %>% 
+    gather(dates, value, -rowname) %>% 
+    spread(rowname, value) %>%
+    mutate(dates = ymd(dates),
+          views = as.integer(`1`)) %>%
+    select(-`1`)
+}
+
+extract_ts_nrm <- function(rownr){
+  tdates %>%
+    filter_((interp(~x == row_number(), .values = list(x = rownr)))) %>%
+    rownames_to_column %>% 
+    gather(dates, value, -rowname) %>% 
+    spread(rowname, value) %>%
+    mutate(dates = ymd(dates),
+          views = as.integer(`1`)) %>%
+    select(-`1`) %>%
+    mutate(views = views/mean(views))
+}
+```
+
+A custom-made plotting function allows us to visualise each time series and extract its meta data:
+
+```{r}
+plot_rownr <- function(rownr){
+  art <- tpages %>% filter(rowname == rownr) %>% .$article
+  loc <- tpages %>% filter(rowname == rownr) %>% .$locale
+  acc <- tpages %>% filter(rowname == rownr) %>% .$access
+  extract_ts(rownr) %>%
+    ggplot(aes(dates, views)) +
+    geom_line() +
+    geom_smooth(method = "loess", color = "blue", span = 1/5) +
+    labs(title = str_c(art, " - ", loc, " - ", acc))
+}
+
+plot_rownr_log <- function(rownr){
+  art <- tpages %>% filter(rowname == rownr) %>% .$article
+  loc <- tpages %>% filter(rowname == rownr) %>% .$locale
+  acc <- tpages %>% filter(rowname == rownr) %>% .$access
+  extract_ts_nrm(rownr) %>%
+    ggplot(aes(dates, views)) +
+    geom_line() +
+    geom_smooth(method = "loess", color = "blue", span = 1/5) +
+    labs(title = str_c(art, " - ", loc, " - ", acc)) +
+    scale_y_log10() + labs(y = "log views")
+}
+
+plot_rownr_zoom <- function(rownr, start, end){
+  art <- tpages %>% filter(rowname == rownr) %>% .$article
+  loc <- tpages %>% filter(rowname == rownr) %>% .$locale
+  acc <- tpages %>% filter(rowname == rownr) %>% .$access
+  extract_ts(rownr) %>%
+    filter(dates > ymd(start) & dates <= ymd(end)) %>%
+    ggplot(aes(dates, views)) +
+    geom_line() +
+    #geom_smooth(method = "loess", color = "blue", span = 1/5) +
+    #coord_cartesian(xlim = ymd(c(start,end))) +  
+    labs(title = str_c(art, " - ", loc, " - ", acc))
+}
+```
+
+This is how it works (to visualise timey-wimey stuff):
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Fig. 1", out.width="100%"}
+plot_rownr(11214)
+```
+
+In addition, with the help of the extractor tool we define a function that re-connects the *Page* information to the corresponding time series and plots this curve according to our specification on *article* name, *access* type, and *agent* for all the available languages:
+
+```{r}
+plot_names <- function(art, acc, ag){
+
+  pick <- tpages %>% filter(str_detect(article, art)) %>%
+    filter(access == acc) %>%
+    filter(agent == ag)
+  pick_nr <- pick %>% .$rowname
+  pick_loc <- pick %>% .$locale
+
+  tdat <- extract_ts(pick_nr[1]) %>%
+    mutate(loc = pick_loc[1])
+
+  for (i in seq(2,length(pick))){
+    foo <- extract_ts(pick_nr[i]) %>%
+    mutate(loc = pick_loc[i])
+    tdat <- bind_rows(tdat,foo)
+  }
+
+  plt <- tdat %>%
+    ggplot(aes(dates, views, color = loc)) +
+    geom_line() + 
+    labs(title = str_c(art, "  -  ", acc, "  -  ", ag))
+
+  print(plt)
+}
+
+plot_names_nrm <- function(art, acc, ag){
+
+  pick <- tpages %>% filter(str_detect(article, art)) %>%
+    filter(access == acc) %>%
+    filter(agent == ag)
+  pick_nr <- pick %>% .$rowname
+  pick_loc <- pick %>% .$locale
+
+  tdat <- extract_ts_nrm(pick_nr[1]) %>%
+    mutate(loc = pick_loc[1])
+
+  for (i in seq(2,length(pick))){
+    foo <- extract_ts_nrm(pick_nr[i]) %>%
+    mutate(loc = pick_loc[i])
+    tdat <- bind_rows(tdat,foo)
+  }
+
+  plt <- tdat %>%
+    ggplot(aes(dates, views, color = loc)) +
+    geom_line() + 
+    labs(title = str_c(art, "  -  ", acc, "  -  ", ag)) +
+    scale_y_log10() + labs(y = "log views")
+
+  print(plt)
+}
+```
+
+
+
+Here is a classic example:
+
+
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Fig. 2", out.width="100%"}
+
+plot_names("One_Direction", "all-access", "all-agents")
+
+```
+
+
+
+These are the tools we need for a visual examinination of arbitrary individual time series data. In the following, we will use them to illustrate specific observations that are of particular interest.
+
+# Summary parameter extraction
+In the next step we will have a more global look at the population parameters of our training time series data. Also here, we will start with the *wikipedia* data. The idea behind this approach is to probe the parameter space of the time series information along certain key metrics and to identify extreme observations that could break our forecasting strategies.
+
+## Projects data overview
+Before diving into the time series data let's have a look how the different meta-parameters are distributed:
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Fig. 3", out.width="100%"}
+
+p1 <- tpages %>% 
+
+  ggplot(aes(agent)) + geom_bar(fill = "pink")
+
+p2 <- tpages %>% 
+
+  ggplot(aes(access)) + geom_bar(fill = "lightblue")
+
+p3 <- tpages %>% 
+
+  ggplot(aes(locale, fill = locale)) + geom_bar() + theme(legend.position = "none") + scale_fill_hue(c=45, l=80)
+
+
+
+
+layout <- matrix(c(1,2,3,3),2,2,byrow=TRUE)
+
+multiplot(p1, p2, p3, layout=layout)
+
+```
+
+
+
+We find that our *wikipedia* data includes 7 languages: German, English, Spanish, French, Japanese, Russian, and Chinese. All of those are more frequent than the *mediawiki* and *wikimedia* pages. Mobile sites are slightly more frequent than desktop ones.
+
+## Basic time series parameters
+We start with a basic set of parameters: mean, standard deviation, amplitude, and a the slope of a naive linear fit. This is our extraction function:
+
+```{r}
+
+params_ts1 <- function(rownr){
+
+  foo <- tdates %>%
+
+    filter_((interp(~x == row_number(), .values = list(x = rownr)))) %>%
+
+    rownames_to_column %>% 
+
+    gather(dates, value, -rowname) %>% 
+
+    spread(rowname, value) %>%
+
+    mutate(dates = ymd(dates),
+
+          views = as.integer(`1`))
+
+    
+
+  slope <- ifelse(is.na(mean(foo$views)),0,summary(lm(views ~ dates, data = foo))$coef[2])
+
+  slope_err <- ifelse(is.na(mean(foo$views)),0,summary(lm(views ~ dates, data = foo))$coef[4])
+
+
+
+  bar <- tibble(
+
+    rowname = rownr,
+
+    min_view = min(foo$views),
+
+    max_view = max(foo$views),
+
+    mean_view = mean(foo$views),
+
+    med_view = median(foo$views),
+
+    sd_view = sd(foo$views),
+
+    slope = slope/slope_err
+
+  )
+
+  
+
+  return(bar)
+
+}
+
+```
+
+
+
+And here we run it. (Note, that in this kernel version I'm currently using a sub-sample of the data for reasons of runtime. My extractor function is not very elegant, yet, and exceeds the kernel runtime for the complete data set.)
+
+
+
+```{r}
+
+set.seed(4321)
+
+foo <- sample_n(tpages, 5500) #5500
+
+#foo <- tpages
+
+rows <- foo$rowname
+
+pcols <- c("rowname", "min_view", "max_view", "mean_view", "med_view", "sd_view", "slope")
+
+
+
+params <- params_ts1(rows[1])
+
+for (i in seq(2,nrow(foo))){
+
+  params <- full_join(params, params_ts1(rows[i]), by = pcols)
+
+}
+
+
+
+params <- params %>%
+
+  filter(!is.na(mean_view)) %>%
+
+  mutate(rowname = as.character(rowname))
+
+```
+
+
+## Overview visualisations
+
+
+
+Let's explore the parameter space we've built. (The global shape of the distributions should not be affected by the sampling.) First we plot the histograms of our main parameters:
+
+
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Fig. 4", out.width="100%"}
+
+p1 <- params %>% 
+
+  ggplot(aes(mean_view)) + geom_histogram(fill = "red", bins = 50) + scale_x_log10()
+
+p2 <- params %>% 
+
+  ggplot(aes(max_view)) + geom_histogram(fill = "red", bins = 50) + scale_x_log10()
+
+p3 <- params %>% 
+
+  ggplot(aes(sd_view/mean_view)) + geom_histogram(fill = "red", bins = 50) + scale_x_log10()
+
+p4 <- params %>% 
+
+  ggplot(aes(slope)) + geom_histogram(fill = "red", bins = 30) + 
+
+  scale_x_continuous(limits = c(-25,25))
+
+
+
+layout <- matrix(c(1,2,3,4),2,2,byrow=TRUE)
+
+multiplot(p1, p2, p3, p4, layout=layout)
+
+```
+
+
+
+We find:
+
+
+
+- The distribution of average views is clearly bimodal, with peaks around 10 and 200-300 views. Something similar is true for the number of maximum views, although here the first peak (around 200) is curiuosly narrow. The second peak is centred above 10,000.
+
+
+
+- The distribution of standard deviations (divided by the mean) is skewed toward higher values with larger numbers of spikes or stronger variability trends. Those will be the observations that are more challenging to forecast.
+
+
+
+- The slope distribution is resonably symmetric and centred notably above zero.
+
+
+
+Let's split it up by *locale* and focus on the densities:
+
+
+
+```{r fig.align = 'default', warning = FALSE, fig.cap ="Fig. 5", out.width="100%"}
+
+par_page <- left_join(params,tpages, by = "rowname")
+
+p1 <- par_page %>% 
+
+  ggplot(aes(mean_view, fill = locale)) +
+
+  geom_density(position = "stack") +
+
+  scale_x_log10(limits = c(1,1e4)) +
+
+  theme(legend.position = "none")
+
+p2 <- par_page %>% 
+
+  ggplot(aes(max_view, fill = locale)) +
+
+  geom_density(position = "stack") +
+
+  scale_x_log10(limits = c(10,1e6)) +
+
+  theme(legend.position = "none")
+
+p3 <- par_page %>%
+
+  ggplot(aes(sd_view, fill = locale)) +
+
+  geom_density(position = "stack") +
+
+  scale_x_log10(limits = c(1,1e5)) +
+
+  theme(legend.position = "none")
+
+p4 <- par_page %>% 
+
+  ggplot(aes(slope, fill = locale)) +
+
+  geom_density(position = "stack") + 
+
+  scale_x_continuous(limits = c(-10,10))
+
+
+
+layout <- matrix(c(1,2,3,4),2,2,byrow=TRUE)
+
+multiplot(p1, p2, p3, p4, layout=layout)
+
+```
+
+
+
+We find:
+
+
+
+- The chinese pages (zh, in pink) are slightly but notably different from the rest. The have lower mean and max views and also less variation. Their slope distribution is broader, but also shifted more towards positive values compared to the other curves.
+
+
+
+- The peak in max views around 200-300 is most pronounced in the french pages (fr, in turquoise).
+
+
+
+- The english pages (en, in mustard) have the highest mean and maximum views, which is not surprising.
+
+
+
+
+
+Next, we will examine binned 2-d histograms.
+
+## "Boy Bands" work done (below) for ses(Exp smoothing), HoltWinters and Arima
+### 1. Exponential smoothing Functions
+```{r}
+plot_ses <- function(rownr, alpha){
+  
+  pageviews <- extract_ts(rownr) %>%
+
+    rownames_to_column() %>%
+
+    mutate(rowname = as.integer(rowname))
+
+  pred_len <- 60
+  
+  pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+  #print(pred_range)
+  
+  pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+  
+  post_views <- pageviews %>% tail(pred_len)
+  
+  #pageviews_diff = diff(pageviews)
+  #post_views_diff <- pageviews_diff %>% tail(pred_len)
+  
+  #pre_views_diff <- pageviews_diff %>% head(nrow(pageviews_diff)-pred_len)
+  #print(pre_views)
+ 
+  #print(post_views)
+
+  ses.boyband <- ses(tsclean(ts(pre_views$views, frequency = 7)) , alpha = alpha, h = 60)
+  autoplot(ses.boyband) + 
+  ggtitle("Exponential Smoothing with raw data") +
+  geom_line(aes(rowname/7, views), data = post_views, color = "grey40") +
+
+  labs(x = "Time [weeks]", y = "Views vs SeS predictions  ")
+  
+}
+
+plot_ses_diff <- function(rownr, alpha){
+  
+  pageviews <- extract_ts(rownr) %>%
+
+    rownames_to_column() %>%
+
+    mutate(rowname = as.integer(rowname))
+
+  pred_len <- 60
+  
+  pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+  #print(pred_range)
+  
+  pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+  
+  post_views <- pageviews %>% tail(pred_len)
+  head(post_views)
+   
+  ses.boyband <- ses(tsclean(ts(diff(pre_views$views), frequency = 7)) , alpha = alpha, h = 60)
+  
+ p1 =  autoplot(ses.boyband)  + 
+       ggtitle("Exponential Smoothing with differenced data") +
+  labs(x = "Time [weeks]", y = "differenced Views vs SeS predictions  ")
+
+  
+  return (p1)
+}
+    
+```
+
+
+
+## Plot MAE for different alpha values. To find optimal Alpha.
+
+```{r}
+plot_alpha_MAE <- function(rownr){
+ # Try different alpha values
+  alpha <- seq(.01, .99, by = .01)
+  MAE <- NA
+  
+  # Extract time series data for this row number
+  pageviews <- extract_ts(rownr) %>%
+    rownames_to_column() %>%
+    mutate(rowname = as.integer(rowname))
+  
+  # Train & Test data
+  pred_len <- 60
+  
+  pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+   
+  pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+  
+  post_views <- pageviews %>% tail(pred_len)
+  
+  #Loop through various differences ses fits  
+  for(i in seq_along(alpha)) {
+      fit <- ses(tsclean(ts(diff(pre_views$views), frequency = 7)) , alpha = alpha[i], h = 60)
+      MAE[i] <- accuracy(fit, diff(post_views$views))[2,3]
+    }
+  
+  # convert to a data frame and idenitify min alpha value
+  alpha.fit <- data_frame(alpha, MAE)
+  alpha.min <- filter(alpha.fit, MAE == min(MAE))
+  
+  # plot MAE vs. alpha
+  ggplot(alpha.fit, aes(alpha, MAE)) +
+    geom_line() +
+    ggtitle("Optimizing Alpha for Exponential Smoothing") +
+    geom_point(data = alpha.min, aes(alpha, MAE), size = 2, color = "blue")  
+}
+``` 
+
+ 
+
+SeS (Exp Smoothing) - Differencing, Optimizing for alpha
+
+In our model we used the standard alpha = 0.20; however, we can tune our alpha parameter to identify the value that reduces our forecasting error. Here we loop through alpha values from 0.01-0.99 and identify the level that minimizes our test MAE. Turns out that alpha = 0.52 minimizes our prediction error. We plug this back into our ses. 
+## Trying One-direction data (rownumber = 38794) with
+1. Plot exponential smoothing with alpha = 0.2
+2. Plot exponential smoothing with differenced data.
+3. Print accuracy with differenced ses model
+4. Plot for determining optimal alpha
+5. Plot exponential smoothing with differenced data and optimal alpha.
+
+```{r}
+#Plot 
+plot_ses(38794, 0.48)
+plot_alpha_MAE(38794)
+
+plot_alpha_MAE(28108)
+plot_ses_diff(38794, 0.48)
+```
+### 2.    Holt Winters process here on
+
+# Plot Holt Winters below
+```{r}
+plot_hw_rownr <- function(rownr, gamma, type){
+  
+  pageviews <- extract_ts(rownr) %>%
+
+    rownames_to_column() %>%
+
+    mutate(rowname = as.integer(rowname))
+
+  pred_len <- 60
+  
+  pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+  #print(pred_range)
+  
+  pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+  #print(pre_views)
+  
+  post_views <- pageviews %>% tail(pred_len)
+  #print(post_views)
+
+  views.ts <- tsclean(ts(pre_views$views, frequency = 7)) 
+  
+
+   hw.model <- ets( views.ts , type, gamma = gamma)
+    fc_views <- forecast(hw.model, h = 60)
+
+  p1 = autoplot(fc_views) +
+
+    geom_line(aes(rowname/7, views), data = post_views, color = "grey40") +
+
+    labs(x = "Time [weeks]", y = "Views vs Holt Winter predictions")
+    print(accuracy(fc_views, post_views$views))
+    
+    return(p1 )  
+
+}
+
+```
+
+# Plot Holt Winters MAE below for various gammas
+
+```{r}
+plot_hw_MAE <- function(rownr){
+  
+  gamma <- seq(0.01, 0.85, 0.01)
+  MAE <- NA
+  
+  pageviews <- extract_ts(rownr) %>%
+  
+      rownames_to_column() %>%
+  
+      mutate(rowname = as.integer(rowname))
+
+  pred_len <- 60
+  
+  pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+  #print(pred_range)
+  
+  pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+  #print(pre_views)
+  
+  post_views <- pageviews %>% tail(pred_len)
+  #print(post_views)
+
+  views.ts <- tsclean(ts(pre_views$views, frequency = 7)) 
+  
+  for(i in seq_along(gamma)) {
+    hw.model <- ets( views.ts , 'MAM', gamma = gamma[i])
+    fc_views <- forecast(hw.model, h = 60)
+     
+    MAE[i] = accuracy(fc_views, post_views$views)[2,3]
+  }
+
+error <- data_frame(gamma, MAE)
+minimum <- filter(error, MAE == min(MAE))
+ggplot(error, aes(gamma, MAE)) +
+  geom_line() +
+  geom_point(data = minimum, color = "blue", size = 2) +
+  ggtitle("gamma's impact on forecast errors",
+          subtitle = "gamma that minimizes MAE")
+
+}
+ 
+```
+
+Below, we wrap Decomposing and plotting process into a function and then apply it to four time series sets that we know from our previous analysis:
+ 
+```{r}
+plot_hw_decompose <- function(rownr, type) {
+    pageviews <- extract_ts(rownr) %>%
+      rownames_to_column() %>%
+      mutate(rowname = as.integer(rowname))
+   
+    
+ 
+     autoplot(decompose(tsclean(ts(pageviews$views, frequency = 7)) , type = type))
+}
+```
+
+## Main Holt Winters process for One_Direction data.
+```{r}
+#Decompose 
+plot_hw_decompose(38794, "additive")
+plot_hw_decompose(38794, "mult")
+plot_hw_MAE(38794)
+p1 <- plot_hw_rownr(38794,0.025,'MAM')
+
+p1
+ 
+    
+```
+#### Build a SARIMA Model
+Seasonal Difference and ACF
+```{r}
+
+rownr <- 38794
+
+pageviews <- extract_ts(rownr) %>%
+  
+      rownames_to_column() %>%
+  
+      mutate(rowname = as.integer(rowname))
+
+pred_len <- 60
+
+pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+#print(pred_range)
+
+pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+#print(pre_views)
+
+post_views <- pageviews %>% tail(pred_len)
+views.ts <- tsclean(ts(pre_views$views, frequency = 7))
+ 
+ 
+tsdisplay(diff(views.ts,7))
+
+require("tseries")
+kpss.test(diff(views.ts,7)) # p-value = 0.1 > 0.05 ==> Accept Null hypothesis ==> The process is stationary.
+
+sarima.model <-auto.arima(diff(views.ts,7), seasonal = TRUE, trace = TRUE, stepwise = FALSE, approximation =FALSE, max.p = 3, max.q = 3, max.P = 2, max.Q = 2,allowdrift = FALSE, num.cores = 4, ic=c('aic'))
+fc_views <- forecast(sarima.model, h = 60)
+
+p1 = autoplot(fc_views) +
+
+labs(x = "Time [weeks]", y = "Views vs sArima predictions")
+
+p1  
+
+
+accuracy(fc_views, diff(post_views$views,7))
+  
+```
+#### Build a TBATS Model
+
+```{r}
+rownr <- 38794
+
+pageviews <- extract_ts(rownr) %>%
+  
+      rownames_to_column() %>%
+  
+      mutate(rowname = as.integer(rowname))
+
+pred_len <- 60
+
+pred_range <- c(nrow(pageviews)-pred_len+1, nrow(pageviews))
+#print(pred_range)
+
+pre_views <- pageviews %>% head(nrow(pageviews)-pred_len)
+#print(pre_views)
+
+post_views <- pageviews %>% tail(pred_len)
+views.ts <- tsclean(ts(pre_views$views, frequency = 7))
+ 
+
+tbats.model <- tbats(views.ts, use.parallel=TRUE, num.cores = 2) # fit tbats model
+fc_views <- forecast(tbats.model, h = 60)
+
+p1 = autoplot(fc_views) +
+
+labs(x = "Time [weeks]", y = "Views vs sArima predictions")
+
+p1  
+
+
+accuracy(fc_views, diff(post_views$views,7))
+  
+
+```
